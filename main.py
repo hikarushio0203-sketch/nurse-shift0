@@ -1,15 +1,17 @@
 import streamlit as st
-import pandas as pd
+import pandas as pd  # ここを修正しました
 from ortools.sat.python import cp_model
 import datetime
 import jpholiday
 import calendar
 import io
 import unicodedata
+import time
 
 # 1. ページ基本設定
 st.set_page_config(page_title="看護師勤務表作成AI", layout="wide")
-st.title("看護師勤務表作成AI🩺✨（新人ペア禁止・完全版）")
+st.title("勤務表自動作成ソフト🩺✨")
+st.markdown("### 夜勤差設定 ＆ 最大10分思考")
 
 def clean_text(text):
     if not isinstance(text, str): return str(text)
@@ -28,7 +30,7 @@ def create_template():
         yaku = "主任" if i <= 7 else "一般"
         kubun = "既卒" if i <= 26 else "新人"
         kotai = 3 if 14 <= i <= 25 else 2
-        data.append([i, yaku, kubun, kotai, ""] + [""] * 31)
+        data.append([f"看護師{i}", yaku, kubun, kotai, ""] + [""] * 31)
     template_df = pd.DataFrame(data, columns=cols)
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
@@ -36,7 +38,7 @@ def create_template():
     return output.getvalue()
 
 st.sidebar.download_button(
-    label="👉 サンプル入りExcel(29名分)をダウンロード",
+    label="👉 サンプル入りExcelをダウンロード",
     data=create_template(),
     file_name="meibo_template.xlsx",
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
@@ -53,7 +55,7 @@ if uploaded_file is not None:
         st.success(f"名簿（{len(df)}名）の読み込みに成功しました。")
 
         # 設定
-        st.sidebar.header("📅 ステップ2：設定")
+        st.sidebar.header("📅 ステップ2：作成設定")
         year = st.sidebar.number_input("作成年", value=2026)
         month = st.sidebar.number_input("作成月", value=1, min_value=1, max_value=12)
         _, num_days = calendar.monthrange(year, month)
@@ -64,9 +66,12 @@ if uploaded_file is not None:
 
         st.sidebar.header("👥 人数設定")
         req_day_wk = st.sidebar.slider("平日日勤（目標）", 1, 20, 10)
-        req_day_hol = st.sidebar.slider("休日日勤（完全固定）", 1, 20, 4)
+        req_day_hol = st.sidebar.slider("休日日勤（固定）", 1, 20, 4)
         req_semi = st.sidebar.slider("準夜（固定）", 1, 5, 2)
         req_late = st.sidebar.slider("深夜（固定）", 1, 5, 2)
+
+        st.sidebar.header("⚖️ 平準化ルール設定")
+        night_diff_limit = st.sidebar.slider("夜勤回数の最大個人差（回）", 0, 5, 2, help="2回が推奨。厳しすぎる場合は増やしてください。")
 
         if st.button("最強ルールで勤務表を生成する"):
             model = cp_model.CpModel()
@@ -97,15 +102,12 @@ if uploaded_file is not None:
                             model.Add(x[n, d, mapping[val]] == 1)
                             hopes_map[(n, d)] = mapping[val]
 
-            # --- 最強ルール：新人同士の夜勤ペア禁止（ここを追加！） ---
+            # --- ルール：新人ペア禁止・前月継続・セット勤務・インターバル ---
             for d in range(num_days):
                 if len(novice_indices) > 0:
-                    # 同じ日の準夜に新人は最大1人まで
                     model.Add(sum(x[n, d, "準夜"] for n in novice_indices) <= 1)
-                    # 同じ日の深夜に新人は最大1人まで
                     model.Add(sum(x[n, d, "深夜"] for n in novice_indices) <= 1)
 
-            # --- 最強ルール：前月継続性 ---
             for n in range(num_nurses):
                 if '前月最終' in df.columns:
                     last = clean_text(str(df.iloc[n]['前月最終']))
@@ -119,11 +121,10 @@ if uploaded_file is not None:
                         elif "深夜" in last:
                             model.Add(x[n, 0, "休み"] == 1)
 
-            # --- 最強ルール：セット勤務とインターバル ---
             for n in range(num_nurses):
                 is_3 = (int(df.iloc[n].get('交代', 2)) == 3)
                 for d in range(num_days):
-                    if is_3: # 3交代
+                    if is_3:
                         if d < num_days - 1:
                             model.Add(x[n, d+1, "準夜"] == 1).OnlyEnforceIf(x[n, d, "深夜"])
                             model.Add(x[n, d, "深夜"] == 1).OnlyEnforceIf(x[n, d+1, "準夜"])
@@ -132,24 +133,22 @@ if uploaded_file is not None:
                         if d > 0:
                             model.Add(x[n, d-1, "日勤"] == 1).OnlyEnforceIf(x[n, d, "深夜"])
                         if d < num_days - 6:
-                            for i in range(1, 6):
-                                model.Add(x[n, d+i, "深夜"] == 0).OnlyEnforceIf(x[n, d, "深夜"])
-                    else: # 2交代
+                            for i in range(1, 6): model.Add(x[n, d+i, "深夜"] == 0).OnlyEnforceIf(x[n, d, "深夜"])
+                    else:
                         if d < num_days - 1:
                             model.Add(x[n, d+1, "深夜"] == 1).OnlyEnforceIf(x[n, d, "準夜"])
                             model.Add(x[n, d, "準夜"] == 1).OnlyEnforceIf(x[n, d+1, "深夜"])
                         if d < num_days - 2:
                             model.Add(x[n, d+2, "休み"] == 1).OnlyEnforceIf(x[n, d+1, "深夜"])
                         if d < num_days - 5:
-                            for i in range(1, 5):
-                                model.Add(x[n, d+i, "準夜"] == 0).OnlyEnforceIf(x[n, d, "準夜"])
+                            for i in range(1, 5): model.Add(x[n, d+i, "準夜"] == 0).OnlyEnforceIf(x[n, d, "準夜"])
 
-            # --- 公平性と公休 ---
+            # --- 公平性と夜勤格差 ---
             for n in range(num_nurses):
                 model.Add(sum(x[n, d, "休み"] for d in range(num_days)) == h_count)
                 f_h = sum(x[n, d, "準夜"] + x[n, d, "深夜"] for d in range(min(15, num_days)))
                 s_h = sum(x[n, d, "準夜"] + x[n, d, "深夜"] for d in range(min(15, num_days), num_days))
-                diff = model.NewIntVar(0, 5, f'df_{n}')
+                diff = model.NewIntVar(0, 10, f'df_{n}')
                 model.Add(diff >= f_h - s_h); model.Add(diff >= s_h - f_h); model.Add(diff <= 2)
 
             nt = [model.NewIntVar(0, num_days, f'nt_{n}') for n in range(num_nurses)]
@@ -158,7 +157,7 @@ if uploaded_file is not None:
             mi, ma = model.NewIntVar(0, num_days, 'mi'), model.NewIntVar(0, num_days, 'ma')
             for n in range(num_nurses):
                 model.Add(mi <= nt[n]); model.Add(ma >= nt[n])
-            model.Add(ma - mi <= 4)
+            model.Add(ma - mi <= night_diff_limit)
 
             # --- 人数制限 ---
             for d in range(num_days):
@@ -173,17 +172,34 @@ if uploaded_file is not None:
                     model.Add(sum(x[n, d, "日勤"] for n in range(num_nurses)) + u - o == t)
                     penalties.append(u * 100); penalties.append(o * 10)
 
-            # 解決
             model.Minimize(sum(penalties))
+
+            # --- 【粘り強い探索ロジック】 ---
             solver = cp_model.CpSolver()
-            solver.parameters.max_time_in_seconds = 60.0
-            status = solver.Solve(model)
+            start_time = time.time()
+            max_wait_time = 600  # 最大10分
+            status = None
+            attempt = 1
+
+            with st.status("勤務表を作成中...（最大10分間試行します）", expanded=True) as status_box:
+                while time.time() - start_time < max_wait_time:
+                    status_box.write(f"🔄 試行 {attempt} 回目（経過: {int(time.time() - start_time)}秒）...")
+                    solver.parameters.random_seed = attempt
+                    solver.parameters.max_time_in_seconds = 30.0 # 1回の試行を30秒に
+                    
+                    status = solver.Solve(model)
+                    
+                    if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
+                        status_box.update(label="✅ 成功しました！", state="complete")
+                        break
+                    
+                    attempt += 1
+                    if time.time() - start_time > max_wait_time - 5: break
 
             if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
                 d_cls = [f"{d+1}({['月','火','水','木','金','土','日'][datetime.date(year,month,d+1).weekday()]})" for d in range(num_days)]
                 
-                # A. 毎日の集計
-                st.subheader("📊 毎日の合計人数（縦の合計）")
+                st.subheader("📊 毎日の合計人数")
                 summ_list = []
                 for s in ["日勤", "準夜", "深夜", "休み"]:
                     row = {"シフト": s}
@@ -192,7 +208,6 @@ if uploaded_file is not None:
                     summ_list.append(row)
                 st.table(pd.DataFrame(summ_list))
 
-                # B. 詳細表示
                 st.subheader("📋 勤務表詳細")
                 
                 def style_output(res):
@@ -225,6 +240,6 @@ if uploaded_file is not None:
                 with pd.ExcelWriter(out, engine='openpyxl') as wr: res_df.to_excel(wr, index=False)
                 st.download_button("Excelで保存", data=out.getvalue(), file_name=f"kimmubyo_{year}_{month}.xlsx")
             else:
-                st.error("❌ 条件が厳しすぎます（新人の夜勤枠が足りない可能性があります）。設定を調整してください。")
+                st.error("❌ 10分間試行しましたが解決策が見つかりませんでした。設定を調整してください。")
     except Exception as e:
         st.error(f"エラーが発生しました: {e}")
